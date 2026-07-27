@@ -116,7 +116,8 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    
+    return (run_silu(in_features @ w1_weight.T) * (in_features @ w3_weight.T)) @ w2_weight.T
 
 
 def run_scaled_dot_product_attention(
@@ -203,8 +204,19 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
 
+    assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+    d_k = d_model // num_heads
+    batch_dims = in_features.shape[:-2]
+    seq_len = in_features.shape[-2]
+
+    Q = (in_features @ q_proj_weight.T).reshape(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+    K = (in_features @ k_proj_weight.T).reshape(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+    V = (in_features @ v_proj_weight.T).reshape(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+
+    result = run_scaled_dot_product_attention(Q=Q, K=K, V=V).transpose(-3, -2).reshape(*batch_dims, seq_len, d_model)
+
+    return result @ o_proj_weight.T
 
 def run_multihead_self_attention_with_rope(
     d_model: int,
@@ -294,8 +306,23 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    freqs = 1.0 / (theta ** (torch.arange(0, d_k, step=2) / d_k))
 
+    angles = token_positions.unsqueeze(-1) * freqs
+
+    cos_val = torch.cos(angles)
+    sin_val = torch.sin(angles)
+
+    x_even = in_query_or_key[..., 0::2]
+    x_odd = in_query_or_key[..., 1::2]
+
+    rotated_even = x_even * cos_val - x_odd * sin_val
+    rotated_odd = x_even * sin_val + x_odd * cos_val
+
+    stacked = torch.stack([rotated_even, rotated_odd], dim=-1)
+    output = stacked.flatten(start_dim=-2)
+    
+    return output
 
 def run_transformer_block(
     d_model: int,
