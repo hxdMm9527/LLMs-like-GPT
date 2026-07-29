@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import numpy as np
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
@@ -275,7 +276,24 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+
+    assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+    d_k = d_model // num_heads
+    batch_dims = in_features.shape[:-2]
+    seq_len = in_features.shape[-2]
+
+    if token_positions is None:
+        token_positions = torch.arange(seq_len, device=in_features.device)
+
+    Q = (in_features @ q_proj_weight.T).reshape(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+    Q = run_rope(d_k=d_k, theta=theta, max_seq_len=max_seq_len, in_query_or_key=Q, token_positions=token_positions)
+    K = (in_features @ k_proj_weight.T).reshape(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+    K = run_rope(d_k=d_k, theta=theta, max_seq_len=max_seq_len, in_query_or_key=K, token_positions=token_positions)
+    V = (in_features @ v_proj_weight.T).reshape(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+
+    result = run_scaled_dot_product_attention(Q=Q, K=K, V=V).transpose(-3, -2).reshape(*batch_dims, seq_len, d_model)
+
+    return result @ o_proj_weight.T
 
 
 def run_rope(
@@ -445,7 +463,16 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    
+    norm1 = run_rmsnorm(d_model=d_model, eps=1e-5, weights=weights["ln1.weight"], in_features=in_features)
+    attn_out = run_multihead_self_attention_with_rope(d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, theta=theta, q_proj_weight=weights["attn.q_proj.weight"], k_proj_weight=weights["attn.k_proj.weight"], v_proj_weight=weights["attn.v_proj.weight"], o_proj_weight=weights["attn.output_proj.weight"], in_features=norm1)
+    y = attn_out + in_features
+
+    norm2 = run_rmsnorm(d_model=d_model, eps=1e-5, weights=weights["ln2.weight"], in_features=y)
+    acti_out = run_swiglu(d_model=d_model, d_ff=d_ff, w1_weight=weights["ffn.w1.weight"], w2_weight=weights["ffn.w2.weight"], w3_weight=weights["ffn.w3.weight"], in_features=norm2)
+    tran_out = acti_out + y
+
+    return tran_out
 
 
 def run_transformer_lm(
@@ -587,8 +614,26 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
 
+    x = run_embedding(vocab_size=vocab_size, d_model=d_model, weights=weights["token_embeddings.weight"], token_ids=in_indices)
+
+    for i in range(num_layers):
+        prefix = f"layers.{i}."
+        block_weights = {
+            k.replace(prefix, ""): v
+            for k, v in weights.items()
+            if k.startswith(prefix)
+        }
+        x = run_transformer_block(d_model=d_model, num_heads=num_heads, d_ff=d_ff, max_seq_len=context_length, theta=rope_theta, weights=block_weights, in_features=x)
+
+    # for k,v in weight.item():
+    #     if k.startswith(prefix):
+    #         k.replace(prefix, ""): v
+
+    x = run_rmsnorm(d_model=d_model, eps=1e-5, weights=weights["ln_final.weight"], in_features=x)
+    x = run_linear(d_in=d_model, d_out=vocab_size, weights=weights["lm_head.weight"], in_features=x)
+
+    return x
 
 def run_rmsnorm(
     d_model: int,
@@ -640,7 +685,6 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     """
     return in_features * torch.sigmoid(in_features)
 
-
 def run_get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -672,9 +716,15 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
 
+    data_len = len(dataset)
+    start_indices = np.random.randint(0, data_len - context_length, size=batch_size)
 
+    x = np.stack([dataset[i : i + context_length] for i in start_indices])
+    y = np.stack([dataset[i + 1 : i + context_length + 1] for i in start_indices])
+
+    return torch.tensor(x, dtype=torch.long, device=device), torch.tensor(y, dtype=torch.long, device=device)
+    
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     # 给定一个输入张量，返回对输入的指定 `dim` 维度做 softmax 的结果。
     # 参数:
@@ -752,7 +802,20 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+
+    total_norm = 0
+
+    for p in parameters:
+        if p.grad is not None:
+            total_norm += torch.norm(p.grad) ** 2
+
+    total_norm = torch.sqrt(total_norm)
+
+    if total_norm > max_l2_norm:
+        scale = max_l2_norm / total_norm
+        for p in parameters:
+            if p.grad is not None:
+                p.grad.mul_(scale)
 
 
 def get_adamw_cls() -> Any:
@@ -760,7 +823,67 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    class AdamW(torch.optim.Optimizer):
+        def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+            defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+            super().__init__(params, defaults)
+
+        @torch.no_grad()
+        def step(self, closure=None):
+
+            loss = None
+
+            # 如果传了 closure，用它再算一次 loss（多数情况不用）
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+
+            for group in self.param_groups:
+                beta1, beta2 = group["betas"]
+                lr = group["lr"]
+                weight_decay = group["weight_decay"]
+                eps = group["eps"]
+
+                for param in group["params"]:
+                    if param.grad is None:
+                        continue
+
+                    # 1. 获取/初始化该参数的状态
+                    state = self.state[param]
+                    if len(state) == 0:
+                        state["step"] = 0
+                        state["exp_avg"] = torch.zeros_like(param)
+                        state["exp_avg_sq"] = torch.zeros_like(param)
+
+                    # 2. 步数 +1
+                    state["step"] += 1
+
+                    # 3. 权重衰减（AdamW 关键：直接减权重，不进动量）
+                    param.mul_(1 - lr * weight_decay)
+
+                    grad = param.grad
+                    exp_avg = state["exp_avg"]
+                    exp_avg_sq = state["exp_avg_sq"]
+
+                    # 4. 更新一阶矩（惯性）
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+
+                    # 5. 更新二阶矩（步长调节）
+                    exp_avg_sq.mul_(beta2).add_(grad ** 2, alpha=1 - beta2)
+
+                    # 6. 偏差修正
+                    t = state["step"]
+                    bias_corr1 = 1 - beta1 ** t
+                    bias_corr2 = 1 - beta2 ** t
+
+                    # 7. 更新参数
+                    denom = (exp_avg_sq / bias_corr2).sqrt() + eps
+                    step_size = lr / bias_corr1
+                    param -= step_size * exp_avg / denom
+
+            return loss  # 如果有 closure，返回 loss；否则 None
+
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -798,8 +921,13 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
-
+    if it < warmup_iters:
+        return max_learning_rate * (it / warmup_iters)
+    elif warmup_iters <= it < cosine_cycle_iters:
+        rate = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        return min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (1 + np.cos(np.pi * rate))
+    else:
+        return min_learning_rate
 
 def run_save_checkpoint(
     model: torch.nn.Module,
@@ -823,8 +951,13 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    pack = {
+        "model_state" : model.state_dict(),
+        "optimizer_state" : optimizer.state_dict(),
+        "iteration" : iteration
+    }
 
+    torch.save(pack, out)
 
 def run_load_checkpoint(
     src: str | os.PathLike | BinaryIO | IO[bytes],
@@ -853,7 +986,11 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    pack = torch.load(src, map_location="cpu")
+    model.load_state_dict(pack["model_state"])
+    optimizer.load_state_dict(pack["optimizer_state"])
+
+    return pack["iteration"]
 
 
 def get_tokenizer(
