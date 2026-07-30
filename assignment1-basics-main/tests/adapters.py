@@ -1023,8 +1023,65 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    class BPETokenizer:
+        def __init__(self, vocab, merges, special_tokens):
+            self.vocab = vocab                    # int → bytes
+            self.special_tokens = special_tokens   # list[str] | None
+            
+            # 建快速查找表
+            self.merge_rank = {(a, b): i for i, (a, b) in enumerate(merges)}
+            
+            # bytes → ID 反向映射（编码时用到）
+            self.bytes_to_id = {b: i for i, b in vocab.items()}
 
+        def encode(self, text):
+            ids = []
+
+            sorted_specials = sorted(special_tokens, key=len, reverse=True)
+
+            while text:
+                found = False
+
+                for st in sorted_specials:
+                    if text.startswith(st):
+                        ids.append(vocab_lookup(st.encode("utf-8")))
+                        text = text[len(st):]
+                        found = True
+                        break
+
+                if not found:
+                    
+
+            return ids
+
+        def decode(self, ids):
+            tokens = [self.vocab[i] for i in ids]
+
+            all_bytes = b"".join(tokens)
+
+            return all_bytes.decode("utf-8", errors="replace")
+
+        def _bpe_encode(self, text):
+            tokens = [bytes([b]) for b in text.encode("utf-8")]     # str → bytes 列表
+
+            while True:
+                best_pair = None
+                best_rank = float('inf')
+
+                for i in range(len(tokens) - 1):
+                    pair = (tokens[i], tokens[i + 1])
+                    rank = self.merge_rank.get(pair)
+                    if rank is not None and rank < best_rank:
+                        best_rank = rank
+                        best_pair = i
+
+                if best_pair is None:
+                    break
+
+                tokens[best_pair] = tokens[best_pair] + tokens[best_pair + 1]       
+                tokens.pop(best_pair + 1)
+
+            return [self.bytes_to_id[t] for t in tokens]  # 每个 bytes 查 ID
 
 def run_train_bpe(
     input_path: str | os.PathLike,
